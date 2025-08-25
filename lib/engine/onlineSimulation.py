@@ -8,7 +8,10 @@ import pybullet as p
 import pybullet_data
 from mayavi import mlab
 import vtk
-from vtk.util.numpy_support import vtk_to_numpy
+try:
+    from vtk.util.numpy_support import vtk_to_numpy
+except Exception:
+    vtk_to_numpy = None
 import cv2
 from PIL import Image
 import time
@@ -25,6 +28,8 @@ from pyrender import IntrinsicsCamera, PerspectiveCamera,\
 
 from .camera import fixedCamera
 from .keyBoardEvents import getDirection
+from lib.navigation.icp_nav_utils import icp_step
+from unet_depth_pipeline import UNetDepthEstimation, load_model
 
 
 def apply_control_pad_icon(image, direction):
@@ -294,17 +299,34 @@ class onlineSimulationWithNetwork(object):
         # fuze_mesh = Mesh.from_trimesh(fuze_trimesh)
         spot_l = SpotLight(color=np.ones(3), intensity=0.3,
                         innerConeAngle=0, outerConeAngle=np.pi/2, range=1)
-        # self.cam = IntrinsicsCamera(fx=181.9375, fy=183.2459, cx=103.0638, cy=95.4945, znear=0.000001)
-        self.cam = IntrinsicsCamera(fx=175 / 1.008, fy=175 / 1.008, cx=200, cy=200, znear=0.00001)
-        self.scene = Scene(bg_color=(0., 0., 0.))
-        self.fuze_node = Node(mesh=fuze_mesh, scale=meshScale, rotation=self.quaternion_model, translation=self.t_model)
-        self.scene.add_node(self.fuze_node)
-        self.spot_l_node = self.scene.add(spot_l)
-        self.cam_node = self.scene.add(self.cam)
-        # self.r = OffscreenRenderer(viewport_width=200, viewport_height=200)
-        self.r = OffscreenRenderer(viewport_width=400, viewport_height=400)
+    # self.cam = IntrinsicsCamera(fx=181.9375, fy=183.2459, cx=103.0638, cy=95.4945, znear=0.000001)
+    self.cam = IntrinsicsCamera(fx=175 / 1.008, fy=175 / 1.008, cx=200, cy=200, znear=0.00001)
+    self.scene = Scene(bg_color=(0., 0., 0.))
+    self.fuze_node = Node(mesh=fuze_mesh, scale=meshScale, rotation=self.quaternion_model, translation=self.t_model)
+    self.scene.add_node(self.fuze_node)
+    self.spot_l_node = self.scene.add(spot_l)
+    self.cam_node = self.scene.add(self.cam)
+    # self.r = OffscreenRenderer(viewport_width=200, viewport_height=200)
+    self.r = OffscreenRenderer(viewport_width=400, viewport_height=400)
 
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # 相机内参(与 OffscreenRenderer 400x400 对应)，并预计算缩放到 200x200 的内参供ICP使用
+    self.fx0 = 175 / 1.008
+    self.fy0 = 175 / 1.008
+    self.cx0 = 200.0
+    self.cy0 = 200.0
+    self.render_size = 400
+    self.output_size = 200
+    s = self.output_size / self.render_size
+    self.fx_200 = self.fx0 * s
+    self.fy_200 = self.fy0 * s
+    self.cx_200 = self.cx0 * s
+    self.cy_200 = self.cy0 * s
+
+    # 深度网络 (UNet) 懒加载
+    self.unet_model = None
+    self.unet_model_path = os.path.join('checkpoints', 'unet_depth_checkpoints', 'best_model.pth')
+
+    self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     
     def smooth_centerline(self, centerlineArray, win_width=10):
@@ -732,6 +754,38 @@ class onlineSimulationWithNetwork(object):
             depth_img = depth_img / 0.5 * 255
             depth_img = depth_img.astype(np.uint8)
             depth_img = cv2.resize(depth_img, (200, 200))
+
+            # ========= 单目深度预测 + ICP 校正 (渲染后，更新下一步控制角) =========
+            try:
+                # 懒加载模型
+                if self.unet_model is None:
+                    self.unet_model = load_model(self.unet_model_path, self.device)
+                # 预处理 RGB (3x200x200 CHW -> NCHW)
+                rgb_tensor = torch.from_numpy(rgb_img).float().unsqueeze(0).to(self.device) / 255.0
+                with torch.no_grad():
+                    pred_depth_m = self.unet_model(rgb_tensor).squeeze().clamp(0, 0.5).cpu().numpy()
+                pred_depth_u8 = (pred_depth_m / 0.5 * 255).astype(np.uint8)
+                # ICP 一步校正当前姿态 (S 系角): 先将当前用于渲染的弧度值映射回控制用的角度
+                pitch_deg_ctrl = (pitch - np.pi/2) * 180.0 / np.pi
+                yaw_deg_ctrl = yaw * 180.0 / np.pi
+                pitch_new, yaw_new, icp_info = icp_step(
+                    pred_depth_u8, depth_img,
+                    self.fx_200, self.fy_200, self.cx_200, self.cy_200,
+                    pitch_deg_ctrl, yaw_deg_ctrl,
+                    alpha=0.4, rmse_thresh=0.012, voxel_size=0.002, max_angle_deg=5.0
+                )
+                # 回写为“控制使用的度”，供后续一步使用
+                pitch = pitch_new
+                yaw = yaw_new
+                # 可选: 训练时保存预测深度
+                if training:
+                    # 构造帧号
+                    frame_idx = len(path_centerline_ratio_list)
+                    cv2.imwrite(os.path.join(pred_depth_saving_root, f'depth_{frame_idx:06d}.jpg'), pred_depth_u8)
+                # 调试输出
+                print(f"ICP rmse={icp_info['rmse']:.6f} dpitch={icp_info['dpitch']:.3f} dyaw={icp_info['dyaw']:.3f}")
+            except Exception as e:
+                print('ICP校正/深度预测失败, 跳过本步:', e)
             # else:
             #     rgb_img, _, _ = self.camera.lookat(yaw, pitch, t, -pos_vector)
             #     rgb_img = rgb_img[:, :, :3]
